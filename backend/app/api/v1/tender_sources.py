@@ -1,15 +1,19 @@
 import uuid
+from datetime import datetime
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, field_validator
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, field_validator, model_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.core.database import get_db
 from app.models import TenderSource, Task
 
 router = APIRouter()
 
 ALLOWED_TYPES = {'aggregator_api', 'direct_api'}
+
 
 class SourceCreate(BaseModel):
     name: str
@@ -32,6 +36,14 @@ class SourceCreate(BaseModel):
             raise ValueError('api_url must start with https://')
         return v
 
+    @model_validator(mode='after')
+    def validate_config_page_size(self):
+        ps = self.config.get('page_size')
+        if ps is not None and not (1 <= ps <= 100):
+            raise ValueError('config.page_size must be between 1 and 100')
+        return self
+
+
 class SourceUpdate(BaseModel):
     name: Optional[str] = None
     api_url: Optional[str] = None
@@ -45,9 +57,29 @@ class SourceUpdate(BaseModel):
             raise ValueError('api_url must start with https://')
         return v
 
+    @model_validator(mode='after')
+    def validate_config_page_size(self):
+        if self.config is not None:
+            ps = self.config.get('page_size')
+            if ps is not None and not (1 <= ps <= 100):
+                raise ValueError('config.page_size must be between 1 and 100')
+        return self
+
+
 class SyncRequest(BaseModel):
     since: Optional[str] = None
     full_resync: bool = False
+
+    @field_validator('since')
+    @classmethod
+    def validate_since(cls, v):
+        if v is not None:
+            try:
+                datetime.fromisoformat(v.replace('Z', '+00:00'))
+            except ValueError:
+                raise ValueError('since must be valid ISO8601 datetime')
+        return v
+
 
 @router.get('')
 async def list_sources(db: AsyncSession = Depends(get_db)):
@@ -70,6 +102,7 @@ async def list_sources(db: AsyncSession = Depends(get_db)):
         ],
     }
 
+
 @router.post('', status_code=201)
 async def create_source(payload: SourceCreate, db: AsyncSession = Depends(get_db)):
     source = TenderSource(
@@ -83,6 +116,7 @@ async def create_source(payload: SourceCreate, db: AsyncSession = Depends(get_db
     await db.commit()
     await db.refresh(source)
     return {'success': True, 'data': {'id': source.id, 'name': source.name}}
+
 
 @router.get('/{source_id}')
 async def get_source(source_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
@@ -105,6 +139,7 @@ async def get_source(source_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
         },
     }
 
+
 @router.put('/{source_id}')
 async def update_source_full(source_id: uuid.UUID, payload: SourceCreate, db: AsyncSession = Depends(get_db)):
     source = await db.get(TenderSource, source_id)
@@ -119,6 +154,7 @@ async def update_source_full(source_id: uuid.UUID, payload: SourceCreate, db: As
     await db.refresh(source)
     return {'success': True, 'data': {'id': source.id, 'name': source.name}}
 
+
 @router.patch('/{source_id}')
 async def update_source(source_id: uuid.UUID, payload: SourceUpdate, db: AsyncSession = Depends(get_db)):
     source = await db.get(TenderSource, source_id)
@@ -130,6 +166,7 @@ async def update_source(source_id: uuid.UUID, payload: SourceUpdate, db: AsyncSe
     await db.refresh(source)
     return {'success': True, 'data': {'id': source.id}}
 
+
 @router.delete('/{source_id}')
 async def delete_source(source_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
     source = await db.get(TenderSource, source_id)
@@ -139,6 +176,7 @@ async def delete_source(source_id: uuid.UUID, db: AsyncSession = Depends(get_db)
     await db.commit()
     return {'success': True, 'data': None}
 
+
 @router.post('/{source_id}/sync', status_code=202)
 async def sync_source(
     source_id: uuid.UUID,
@@ -146,9 +184,11 @@ async def sync_source(
     db: AsyncSession = Depends(get_db),
 ):
     from app.workers.sync_tenders import sync_tenders
+
     existing = await db.get(TenderSource, source_id)
     if not existing:
         raise HTTPException(status_code=404, detail={'code': 'NOT_FOUND', 'message': 'Source not found'})
+
     existing_task = await db.execute(
         select(Task).where(
             Task.entity_type == 'tender_source',
@@ -159,32 +199,73 @@ async def sync_source(
     )
     if existing_task.scalar_one_or_none():
         raise HTTPException(status_code=409, detail={'code': 'CONFLICT', 'message': 'Sync already in progress'})
+
+    since = payload.since if payload else None
+    full_resync = payload.full_resync if payload else False
+
     task = Task(
         task_type='SYNC_TENDERS',
         status='PENDING',
         entity_type='tender_source',
         entity_id=source_id,
-        input_data={'since': payload.since if payload else None, 'full_resync': payload.full_resync if payload else False},
+        input_data={
+            'since': since,
+            'full_resync': full_resync,
+        },
     )
     db.add(task)
     await db.commit()
     await db.refresh(task)
-    celery_task = sync_tenders.delay(str(source_id), str(task.id))
+
+    celery_task = sync_tenders.apply_async(
+        args=[str(source_id), str(task.id)],
+        kwargs={
+            'since': since,
+            'full_resync': full_resync,
+        },
+    )
     task.celery_task_id = celery_task.id
     await db.commit()
+
     return {'success': True, 'data': {'task_id': task.id, 'status': 'ACCEPTED', 'check_url': f'/api/v1/tasks/{task.id}'}}
+
 
 @router.post('/{source_id}/test-connection')
 async def test_connection(source_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
     import httpx
+    import time
+
     source = await db.get(TenderSource, source_id)
     if not source:
         raise HTTPException(status_code=404, detail={'code': 'NOT_FOUND', 'message': 'Source not found'})
+
+    headers = {}
+    if source.api_key_encrypted:
+        headers['X-API-Key'] = source.api_key_encrypted
+
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            start = __import__('time').time()
-            resp = await client.get(source.api_url, params={'limit': 1})
-            latency_ms = int((__import__('time').time() - start) * 1000)
-            return {'success': True, 'data': {'reachable': resp.status_code < 500, 'latency_ms': latency_ms, 'tenders_available': None, 'error': None if resp.status_code < 500 else f'HTTP {resp.status_code}'}}
+            start = time.time()
+            resp = await client.get(source.api_url, params={'limit': 1}, headers=headers)
+            latency_ms = int((time.time() - start) * 1000)
+
+            tenders_available = None
+            if resp.status_code < 500:
+                try:
+                    data = resp.json()
+                    if isinstance(data, list):
+                        tenders_available = len(data)
+                except Exception:
+                    pass
+
+            return {
+                'success': True,
+                'data': {
+                    'reachable': resp.status_code < 500,
+                    'latency_ms': latency_ms,
+                    'tenders_available': tenders_available,
+                    'error': None if resp.status_code < 500 else f'HTTP {resp.status_code}',
+                },
+            }
     except Exception as e:
         return {'success': True, 'data': {'reachable': False, 'latency_ms': None, 'tenders_available': None, 'error': str(e)}}

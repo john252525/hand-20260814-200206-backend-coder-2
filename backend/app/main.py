@@ -1,10 +1,8 @@
 import time
-
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from sqlalchemy import text
-
+from sqlalchemy import text, select
 from app.api.v1.router import api_router
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
@@ -17,6 +15,7 @@ from app.core.exceptions import (
 )
 from app.core.logging_config import setup_logging
 from app.core.middleware import auth_middleware
+from app.models import TenderSource
 
 setup_logging()
 
@@ -46,7 +45,6 @@ ERROR_STATUS_MAP = {
     ValidationError: 422,
 }
 
-
 @app.exception_handler(AppError)
 async def app_error_handler(request: Request, exc: AppError):
     status = ERROR_STATUS_MAP.get(type(exc), 400)
@@ -54,7 +52,6 @@ async def app_error_handler(request: Request, exc: AppError):
         status_code=status,
         content={"success": False, "error": {"code": exc.code, "message": exc.message, "details": exc.details}},
     )
-
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
@@ -73,9 +70,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     )
 
 app.middleware("http")(auth_middleware)
-
 app.include_router(api_router, prefix="/api/v1")
-
 
 async def check_database():
     try:
@@ -84,7 +79,6 @@ async def check_database():
         return "healthy"
     except Exception:
         return "unhealthy"
-
 
 async def check_redis():
     import redis.asyncio as aioredis
@@ -96,13 +90,23 @@ async def check_redis():
     except Exception:
         return "unhealthy"
 
+async def check_tender_source():
+    """Проверяем наличие хотя бы одного активного источника тендеров."""
+    try:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(TenderSource).where(TenderSource.is_active == True).limit(1)
+            )
+            return "healthy" if result.scalar_one_or_none() else "not_configured"
+    except Exception:
+        return "unhealthy"
 
 @app.get("/api/v1/health", tags=["system"])
 async def health():
     db_status = await check_database()
     redis_status = await check_redis()
     llm_status = "healthy" if settings.llm_api_key else "not_configured"
-    source_status = "healthy" if settings.google_search_api_key else "not_configured"
+    source_status = await check_tender_source()
     overall = "healthy" if db_status == "healthy" and redis_status == "healthy" else "degraded"
     return {
         "success": True,
@@ -118,7 +122,6 @@ async def health():
             },
         },
     }
-
 
 @app.get("/", tags=["system"])
 async def root():

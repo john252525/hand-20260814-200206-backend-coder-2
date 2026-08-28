@@ -13,8 +13,10 @@ celery_app = Celery(
         'app.workers.send_communications',
         'app.workers.parse_cp',
         'app.workers.process_incoming',
+        'app.workers.check_incoming',
         'app.workers.webhook_retry',
         'app.workers.negotiate',
+        'app.workers.import_categories',
     ],
 )
 
@@ -39,8 +41,9 @@ celery_app.conf.update(
         },
         'auto-negotiate-periodic': {
             'task': 'auto_negotiate',
-            'schedule': crontab(minute='*/15'),  # каждые 15 минут проверяем таймауты
+            'schedule': crontab(minute='*/15'),
         },
     },
 )
+
 celery_app.autodiscover_tasks(['app.workers'])

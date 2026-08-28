@@ -47,19 +47,16 @@ async def _process(tender_id: str, task_id: str | None = None):
         )
         if not tender:
             return
-
         await change_tender_status(db, tender, "DOCUMENTS_LOADING", note="Начало обработки")
         await change_tender_status(db, tender, "DOCUMENTS_LOADED", note="Документы загружены (демо)")
         await change_tender_status(db, tender, "PROCESSING", note="Извлечение текста")
         await extract_tender_data(db, tender)
         await db.flush()
-
         await change_tender_status(db, tender, "SEMANTIC_FILTERING")
         docs_text = "\n".join(d.parsed_text for d in tender.documents if d.parsed_text)
         text_portrait = f"{tender.title} {tender.description} {docs_text}".strip()[:8000]
         embedding = await generate_embedding(text_portrait)
         tender.embedding = embedding
-
         result = await db.execute(select(Category).where(Category.is_active == True))
         categories = result.scalars().all()
         best_sim = 0.0
@@ -79,11 +76,9 @@ async def _process(tender_id: str, task_id: str | None = None):
                     if fallback_sim > best_sim:
                         best_sim = fallback_sim
                         best_cat = cat
-
         filters = await get_section(db, "filters")
         accept_threshold = filters.get("min_similarity_accept", 0.75)
         uncertain_threshold = filters.get("min_similarity_uncertain", 0.60)
-
         if best_cat and best_sim >= accept_threshold:
             tender.matched_category_id = best_cat.id
             tender.similarity_score = best_sim
@@ -112,25 +107,23 @@ async def _process(tender_id: str, task_id: str | None = None):
                     task.completed_at = datetime.now(timezone.utc)
                     await db.commit()
             return
-
         await change_tender_status(db, tender, "SCORING")
         scoring_settings = await get_section(db, "scoring")
         company_settings = await get_section(db, "company")
         req_result = await db.execute(select(TenderRequirement).where(TenderRequirement.tender_id == tender.id))
         requirements = req_result.scalar_one_or_none()
-        # Исправленный вызов: async, передача db и company_settings
         score, components = await calculate_score(
             tender, scoring_settings, requirements, db=db, company_settings=company_settings
         )
         tender.score = score
         tender.score_components = components
         await change_tender_status(db, tender, "SCORED", note=f"Скор: {score}")
+        await change_tender_status(db, tender, "AWAITING_SUPPLIER_SEARCH", note="Ожидание поиска поставщиков")
         await db.commit()
-
         if task_id:
             task = await db.get(Task, UUID(task_id))
             if task:
                 task.status = "COMPLETED"
-                task.output_data = {"status": "SCORED", "score": score}
+                task.output_data = {"status": "AWAITING_SUPPLIER_SEARCH", "score": score}
                 task.completed_at = datetime.now(timezone.utc)
                 await db.commit()

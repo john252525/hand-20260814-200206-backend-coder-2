@@ -1,3 +1,4 @@
+import uuid
 from typing import Optional
 from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException
@@ -6,80 +7,65 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from app.core.database import get_db
-from app.models import CommercialOffer, LotSupplier, Tender, Task
-from app.services.negotiation_service import request_clarification, request_discount
+from app.models import Tender, Task, LotSupplier
+from app.services.settings_service import get_section
+from app.services.webhook_integration import notify_negotiation_step
+from app.workers.negotiate import negotiate_tender
 
 router = APIRouter()
 
 class NegotiatePayload(BaseModel):
-    action: str = "request_clarification"
+    action: str = 'request_clarification'
     target_supplier_ids: list[UUID] = []
     custom_instructions: Optional[str] = None
 
-async def _get_competitive_prices(db: AsyncSession, tender_id: UUID, except_offer_id: UUID) -> dict:
-    offers_result = await db.execute(
-        select(CommercialOffer)
-        .where(CommercialOffer.tender_id == tender_id, CommercialOffer.id != except_offer_id)
-        .options(selectinload(CommercialOffer.positions))
-    )
-    competitive = {}
-    for offer in offers_result.scalars().all():
-        for pos in offer.positions:
-            if pos.tender_position_id and pos.price_per_unit:
-                current = competitive.get(pos.tender_position_id)
-                if current is None or pos.price_per_unit < current:
-                    competitive[pos.tender_position_id] = pos.price_per_unit
-    return competitive
-
-@router.post("/{tender_id}/negotiate", status_code=202)
+@router.post('/{tender_id}/negotiate', status_code=202)
 async def negotiate(
     tender_id: UUID,
     payload: NegotiatePayload,
     db: AsyncSession = Depends(get_db),
 ):
-    if payload.action not in ("request_clarification", "request_discount"):
-        raise HTTPException(status_code=400, detail={"code": "BAD_REQUEST", "message": "action must be 'request_clarification' or 'request_discount'"})
+    if payload.action not in ('request_clarification', 'request_discount'):
+        raise HTTPException(status_code=400, detail={'code': 'BAD_REQUEST', 'message': "action must be 'request_clarification' or 'request_discount'"})
     tender = await db.get(Tender, tender_id)
     if not tender:
-        raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Tender not found"})
-    query = select(LotSupplier).where(LotSupplier.tender_id == tender_id, LotSupplier.status.notin_(["DECLINED", "NO_RESPONSE"]))
-    if payload.target_supplier_ids:
-        query = query.where(LotSupplier.supplier_id.in_(payload.target_supplier_ids))
-    result = await db.execute(query)
-    lot_suppliers = result.scalars().all()
-    processed = 0
-    for ls in lot_suppliers:
-        if payload.action == "request_clarification":
-            offers = await db.execute(
-                select(CommercialOffer)
-                .where(CommercialOffer.lot_supplier_id == ls.id, CommercialOffer.clarification_needed == True)
-                .options(selectinload(CommercialOffer.positions))
-            )
-        else:
-            offers = await db.execute(
-                select(CommercialOffer)
-                .where(CommercialOffer.lot_supplier_id == ls.id, CommercialOffer.clarification_needed == False, CommercialOffer.status == "FULL")
-                .options(selectinload(CommercialOffer.positions))
-            )
-        offer = offers.scalars().first()
-        if not offer:
-            continue
-        if payload.action == "request_clarification":
-            await request_clarification(db, ls, offer, payload.custom_instructions)
-            processed += 1
-        elif payload.action == "request_discount":
-            competitive = await _get_competitive_prices(db, tender_id, offer.id)
-            if competitive:
-                await request_discount(db, ls, offer, competitive, payload.custom_instructions)
-                processed += 1
-    await db.commit()
-    return {"success": True, "data": {"processed": processed, "status": "ACCEPTED"}}
+        raise HTTPException(status_code=404, detail={'code': 'NOT_FOUND', 'message': 'Tender not found'})
 
-@router.get("/{tender_id}/negotiation-status")
+    # Защита от параллельных задач переговоров
+    existing_task = (await db.execute(
+        select(Task).where(
+            Task.entity_type == 'tender',
+            Task.entity_id == tender_id,
+            Task.task_type == 'NEGOTIATE',
+            Task.status.in_(['PENDING', 'IN_PROGRESS']),
+        )
+    )).scalar_one_or_none()
+    if existing_task:
+        raise HTTPException(status_code=409, detail={'code': 'CONFLICT', 'message': 'Negotiation already in progress'})
+
+    task = Task(
+        task_type='NEGOTIATE',
+        status='PENDING',
+        entity_type='tender',
+        entity_id=tender_id,
+        input_data=payload.model_dump(mode='json'),
+    )
+    db.add(task)
+    await db.commit()
+    await db.refresh(task)
+    celery_task = negotiate_tender.delay(
+        str(tender_id), str(task.id), payload.action,
+        [str(s) for s in payload.target_supplier_ids], payload.custom_instructions
+    )
+    task.celery_task_id = celery_task.id
+    await db.commit()
+    return {'success': True, 'data': {'task_id': task.id, 'status': 'ACCEPTED', 'check_url': f'/api/v1/tasks/{task.id}'}}
+
+@router.get('/{tender_id}/negotiation-status')
 async def negotiation_status(tender_id: UUID, db: AsyncSession = Depends(get_db)):
     tender = await db.get(Tender, tender_id)
     if not tender:
-        raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Tender not found"})
+        raise HTTPException(status_code=404, detail={'code': 'NOT_FOUND', 'message': 'Tender not found'})
     result = await db.execute(
         select(LotSupplier)
         .where(LotSupplier.tender_id == tender_id)
@@ -90,41 +76,56 @@ async def negotiation_status(tender_id: UUID, db: AsyncSession = Depends(get_db)
     )
     lot_suppliers = result.scalars().all()
     statuses = [ls.status for ls in lot_suppliers]
-    if any(s == "NEGOTIATING" for s in statuses):
-        result_status = "IN_PROGRESS"
-    elif any(s in ("CP_REQUESTED", "CP_PARTIALLY_RECEIVED", "CP_FULLY_RECEIVED", "RESPONDED") for s in statuses):
-        result_status = "NOT_STARTED"
+    if any(s == 'NEGOTIATING' for s in statuses):
+        result_status = 'IN_PROGRESS'
+    elif any(s in ('CP_REQUESTED', 'CP_PARTIALLY_RECEIVED', 'CP_FULLY_RECEIVED', 'RESPONDED') for s in statuses):
+        result_status = 'NOT_STARTED'
     else:
-        result_status = "COMPLETED"
+        result_status = 'COMPLETED'
+
     suppliers_info = []
     for ls in lot_suppliers:
         offers = list(ls.commercial_offers)
-        offers.sort(key=lambda o: o.created_at)  # первая версия КП
+        offers.sort(key=lambda o: o.created_at)
         best_margin = None
         initial_margin = None
-        last_action = None
         if offers:
             margins = [o.margin_percent for o in offers if o.margin_percent is not None]
             if margins:
                 best_margin = max(margins)
                 initial_margin = margins[0]
         suppliers_info.append({
-            "supplier_id": ls.supplier_id,
-            "supplier_name": ls.supplier.name if ls.supplier else None,
-            "initial_margin_percent": initial_margin,
-            "current_margin_percent": best_margin,
-            "improvement_percent": (best_margin - initial_margin) if (best_margin is not None and initial_margin is not None) else None,
-            "status": ls.status,
-            "last_action": last_action,
-            "last_action_at": None,
+            'supplier_id': ls.supplier_id,
+            'supplier_name': ls.supplier.name if ls.supplier else None,
+            'initial_margin_percent': initial_margin,
+            'current_margin_percent': best_margin,
+            'improvement_percent': (best_margin - initial_margin) if (best_margin is not None and initial_margin is not None) else None,
+            'status': ls.status,
+            'last_action': None,
+            'last_action_at': None,
         })
+
+    # Получаем количество циклов из последней задачи и max_cycles из настроек
+    from app.models import Task as TaskModel
+    last_task = (await db.execute(
+        select(TaskModel).where(
+            TaskModel.entity_type == 'tender',
+            TaskModel.entity_id == tender_id,
+            TaskModel.task_type == 'NEGOTIATE',
+            TaskModel.status == 'COMPLETED',
+        ).order_by(TaskModel.completed_at.desc()).limit(1)
+    )).scalar_one_or_none()
+    cycles = last_task.output_data.get('cycles_completed', 0) if last_task and last_task.output_data else 0
+    comm_settings = await get_section(db, 'communication')
+    max_cycles = comm_settings.get('max_clarification_cycles', 2)
+
     return {
-        "success": True,
-        "data": {
-            "status": result_status,
-            "cycles_completed": 0,  # TODO: реализовать подсчёт циклов в отдельной таблице
-            "max_cycles": 2,
-            "started_at": None,
-            "suppliers": suppliers_info,
+        'success': True,
+        'data': {
+            'status': result_status,
+            'cycles_completed': cycles,
+            'max_cycles': max_cycles,
+            'started_at': last_task.created_at if last_task else None,
+            'suppliers': suppliers_info,
         },
     }

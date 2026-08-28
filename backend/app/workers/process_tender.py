@@ -8,6 +8,7 @@ from app.services.embedding_service import cosine_similarity, generate_embedding
 from app.services.scoring_service import calculate_score
 from app.services.tender_status_service import change_tender_status
 from app.services.document_parser import extract_tender_data
+from app.services.settings_service import get_section
 from app.workers.celery_app import celery_app
 
 @celery_app.task(name="process_tender", bind=True)
@@ -39,20 +40,26 @@ async def _process(tender_id: str, task_id: str | None = None):
                 task.status = "IN_PROGRESS"
                 await db.commit()
     async with AsyncSessionLocal() as db:
-        tender = await db.get(Tender, UUID(tender_id), options=[selectinload(Tender.documents)])
+        tender = await db.get(
+            Tender,
+            UUID(tender_id),
+            options=[selectinload(Tender.documents), selectinload(Tender.positions)],
+        )
         if not tender:
             return
+
         await change_tender_status(db, tender, "DOCUMENTS_LOADING", note="Начало обработки")
         await change_tender_status(db, tender, "DOCUMENTS_LOADED", note="Документы загружены (демо)")
         await change_tender_status(db, tender, "PROCESSING", note="Извлечение текста")
         await extract_tender_data(db, tender)
         await db.flush()
+
         await change_tender_status(db, tender, "SEMANTIC_FILTERING")
-        # Формируем текстовый портрет из title, description и parsed_text документов
         docs_text = "\n".join(d.parsed_text for d in tender.documents if d.parsed_text)
         text_portrait = f"{tender.title} {tender.description} {docs_text}".strip()[:8000]
         embedding = await generate_embedding(text_portrait)
         tender.embedding = embedding
+
         result = await db.execute(select(Category).where(Category.is_active == True))
         categories = result.scalars().all()
         best_sim = 0.0
@@ -72,10 +79,11 @@ async def _process(tender_id: str, task_id: str | None = None):
                     if fallback_sim > best_sim:
                         best_sim = fallback_sim
                         best_cat = cat
-        from app.services.settings_service import get_section
+
         filters = await get_section(db, "filters")
         accept_threshold = filters.get("min_similarity_accept", 0.75)
         uncertain_threshold = filters.get("min_similarity_uncertain", 0.60)
+
         if best_cat and best_sim >= accept_threshold:
             tender.matched_category_id = best_cat.id
             tender.similarity_score = best_sim
@@ -104,15 +112,21 @@ async def _process(tender_id: str, task_id: str | None = None):
                     task.completed_at = datetime.now(timezone.utc)
                     await db.commit()
             return
+
         await change_tender_status(db, tender, "SCORING")
         scoring_settings = await get_section(db, "scoring")
+        company_settings = await get_section(db, "company")
         req_result = await db.execute(select(TenderRequirement).where(TenderRequirement.tender_id == tender.id))
         requirements = req_result.scalar_one_or_none()
-        score, components = await calculate_score(tender, scoring_settings, requirements, db=db)
+        # Исправленный вызов: async, передача db и company_settings
+        score, components = await calculate_score(
+            tender, scoring_settings, requirements, db=db, company_settings=company_settings
+        )
         tender.score = score
         tender.score_components = components
         await change_tender_status(db, tender, "SCORED", note=f"Скор: {score}")
         await db.commit()
+
         if task_id:
             task = await db.get(Task, UUID(task_id))
             if task:

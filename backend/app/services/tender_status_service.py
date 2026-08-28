@@ -1,10 +1,8 @@
-from uuid import UUID
-
+import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
-
 from app.models import Tender, TenderStatusHistory
-from app.services.webhook_integration import notify_tender_ready_for_decision
 
+logger = structlog.get_logger(__name__)
 
 async def change_tender_status(
     db: AsyncSession,
@@ -12,7 +10,6 @@ async def change_tender_status(
     new_status: str,
     note: str = "",
 ) -> None:
-    """Единая точка смены статуса тендера с записью истории."""
     if tender.status == new_status:
         return
     db.add(
@@ -23,8 +20,6 @@ async def change_tender_status(
             note=note,
         )
     )
+    logger.info("tender.status_changed", tender_id=str(tender.id), previous_status=tender.status, new_status=new_status, note=note)
     tender.status = new_status
     await db.flush()
-    if new_status == "READY_FOR_DECISION":
-        # Уведомляем без передачи db, чтобы не делать дополнительный commit в текущей сессии
-        await notify_tender_ready_for_decision(tender.id)

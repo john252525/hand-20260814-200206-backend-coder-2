@@ -1,20 +1,17 @@
-import asyncio
 import hmac
 import hashlib
 import json
 from datetime import datetime, timezone
 from typing import Optional
-
 import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-
 from app.core.database import AsyncSessionLocal
 from app.models import Webhook
 
 
 async def send_webhook_event(event: str, payload: dict, db: Optional[AsyncSession] = None) -> None:
-    """Отправляет событие во все активные вебхуки."""
+    """Отправляет событие во все активные вебхуки. При неудаче ставит задачу на retry."""
     async def _send(webhook: Webhook, payload: dict):
         data = json.dumps({"event": event, **payload}).encode()
         signature = hmac.new(webhook.secret.encode(), data, hashlib.sha256).hexdigest()
@@ -28,9 +25,14 @@ async def send_webhook_event(event: str, payload: dict, db: Optional[AsyncSessio
             else:
                 webhook.last_status = "error"
                 webhook.retry_count += 1
+                # Планируем retry через 1с, 2с, 4с
+                from app.workers.celery_app import celery_app
+                celery_app.send_task("webhook_retry", args=[str(webhook.id), event, payload], countdown=1)
         except Exception:
             webhook.last_status = "error"
             webhook.retry_count += 1
+            from app.workers.celery_app import celery_app
+            celery_app.send_task("webhook_retry", args=[str(webhook.id), event, payload], countdown=1)
         webhook.last_sent_at = datetime.now(timezone.utc)
 
     if db is None:

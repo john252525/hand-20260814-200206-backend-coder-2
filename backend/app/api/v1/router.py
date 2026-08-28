@@ -2,7 +2,7 @@ from fastapi import APIRouter
 from app.api.v1 import (
     tokens, settings, categories, tasks, tenders, suppliers,
     communications, commercial_offers, negotiations, decisions,
-    webhooks, files, metrics,
+    webhooks, files, metrics, tender_sources, embeddings,
 )
 
 api_router = APIRouter()
@@ -15,7 +15,9 @@ api_router.include_router(tenders.router, prefix="/tenders", tags=["tenders"])
 api_router.include_router(suppliers.router, prefix="/suppliers", tags=["suppliers"])
 api_router.include_router(communications.router, prefix="/communications", tags=["communications"])
 api_router.include_router(commercial_offers.router, prefix="/commercial-offers", tags=["commercial-offers"])
-api_router.include_router(negotiations.router, prefix="/negotiations", tags=["negotiations"])
+api_router.include_router(negotiations.router, prefix="/tenders", tags=["negotiations"])
 api_router.include_router(decisions.router, prefix="/decisions", tags=["decisions"])
 api_router.include_router(webhooks.router, prefix="/webhooks", tags=["webhooks"])
 api_router.include_router(files.router, prefix="/files", tags=["files"])
+api_router.include_router(tender_sources.router, prefix="/tender-sources", tags=["tender-sources"])
+api_router.include_router(embeddings.router, prefix="/embeddings", tags=["embeddings"])

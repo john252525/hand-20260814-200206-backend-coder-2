@@ -2,12 +2,10 @@ import uuid
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
-
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-
 from app.core.database import get_db
 from app.models import Communication, LotSupplier
 
@@ -40,7 +38,6 @@ async def create_communication(payload: CommunicationCreate, db: AsyncSession = 
     lot_supplier = await db.get(LotSupplier, payload.lot_supplier_id)
     if not lot_supplier:
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "LotSupplier not found"})
-
     communication = Communication(
         lot_supplier_id=payload.lot_supplier_id,
         tender_id=lot_supplier.tender_id,

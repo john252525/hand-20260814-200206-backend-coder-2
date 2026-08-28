@@ -1,16 +1,13 @@
 import uuid
 from datetime import datetime
 from typing import Optional
-
 from sqlalchemy import DateTime, ForeignKey, String, Text, func
-from sqlalchemy.orm import Mapped, mapped_column
-
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.models.base import Base, UUIDMixin
-
 
 class Communication(Base, UUIDMixin):
     __tablename__ = "communications"
-
     lot_supplier_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("lot_suppliers.id"), nullable=False
     )
@@ -30,3 +27,6 @@ class Communication(Base, UUIDMixin):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+    # Relationships
+    lot_supplier: Mapped["LotSupplier"] = relationship(backref="communications")

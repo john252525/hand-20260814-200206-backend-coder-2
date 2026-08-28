@@ -1,10 +1,8 @@
 from typing import Any, Dict, Optional
-
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-
 from app.core.database import get_db
 from app.models import Setting, SettingHistory
 
@@ -27,20 +25,25 @@ async def get_section(section: str, db: AsyncSession = Depends(get_db)):
     settings = result.scalars().all()
     if not settings:
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": f"Section '{section}' not found"})
-    data = {s.key: s.value for s in settings}
-    return {"success": True, "data": data}
+    return {"success": True, "data": {s.key: s.value for s in settings}}
 
 
-async def _save_section(section: str, payload: Dict[str, Any], db: AsyncSession):
+async def _save_section(section: str, payload: Dict[str, Any], db: AsyncSession, replace: bool = False):
     result = await db.execute(select(Setting).where(Setting.section == section))
     existing = {s.key: s for s in result.scalars().all()}
-
+    if replace:
+        # Удаляем ключи, которых нет в payload
+        for key in existing.keys() - payload.keys():
+            setting = existing[key]
+            db.add(SettingHistory(setting_id=setting.id, section=section, key=key, old_value=setting.value, new_value=None))
+            await db.delete(setting)
     for key, value in payload.items():
         if key in existing:
             setting = existing[key]
-            old_value = setting.value
-            setting.value = value
-            db.add(SettingHistory(setting_id=setting.id, section=section, key=key, old_value=old_value, new_value=value))
+            if setting.value != value:
+                old_value = setting.value
+                setting.value = value
+                db.add(SettingHistory(setting_id=setting.id, section=section, key=key, old_value=old_value, new_value=value))
         else:
             setting = Setting(section=section, key=key, value=value, description="")
             db.add(setting)
@@ -53,13 +56,13 @@ async def _save_section(section: str, payload: Dict[str, Any], db: AsyncSession)
 
 @router.put("/{section}")
 async def update_section(section: str, payload: Dict[str, Any], db: AsyncSession = Depends(get_db)):
-    await _save_section(section, payload, db)
+    await _save_section(section, payload, db, replace=True)
     return await get_section(section, db)
 
 
 @router.patch("/{section}")
 async def patch_section(section: str, payload: Dict[str, Any], db: AsyncSession = Depends(get_db)):
-    await _save_section(section, payload, db)
+    await _save_section(section, payload, db, replace=False)
     return await get_section(section, db)
 
 

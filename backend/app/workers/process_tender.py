@@ -38,7 +38,6 @@ async def _process(tender_id: str, task_id: str | None = None):
             if task:
                 task.status = "IN_PROGRESS"
                 await db.commit()
-
     async with AsyncSessionLocal() as db:
         tender = await db.get(Tender, UUID(tender_id), options=[selectinload(Tender.documents)])
         if not tender:
@@ -109,7 +108,7 @@ async def _process(tender_id: str, task_id: str | None = None):
         scoring_settings = await get_section(db, "scoring")
         req_result = await db.execute(select(TenderRequirement).where(TenderRequirement.tender_id == tender.id))
         requirements = req_result.scalar_one_or_none()
-        score, components = calculate_score(tender, scoring_settings, requirements)
+        score, components = await calculate_score(tender, scoring_settings, requirements, db=db)
         tender.score = score
         tender.score_components = components
         await change_tender_status(db, tender, "SCORED", note=f"Скор: {score}")

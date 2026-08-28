@@ -1,5 +1,6 @@
 import uuid
 from typing import Optional
+import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, select, update
@@ -9,6 +10,7 @@ from app.core.database import get_db
 from app.models import Supplier, LotSupplier, Communication
 from app.services.supplier_search_service import search_suppliers_in_db, search_suppliers_combined
 
+logger = structlog.get_logger(__name__)
 router = APIRouter()
 
 class SupplierCreate(BaseModel):
@@ -32,7 +34,6 @@ class SupplierCreate(BaseModel):
         if v and not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", v):
             raise ValueError("Invalid email format")
         return v
-
 class SupplierUpdate(BaseModel):
     name: Optional[str] = None
     type: Optional[str] = None
@@ -55,12 +56,10 @@ class SupplierUpdate(BaseModel):
         if v and not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", v):
             raise ValueError("Invalid email format")
         return v
-
 class SupplierSearch(BaseModel):
     query: str = Field(..., min_length=1)
     limit: int = Field(10, ge=1, le=100)
     search_external: bool = True
-
 class MergePayload(BaseModel):
     primary_id: uuid.UUID
     secondary_id: uuid.UUID
@@ -158,6 +157,7 @@ async def create_supplier(payload: SupplierCreate, db: AsyncSession = Depends(ge
     db.add(supplier)
     await db.commit()
     await db.refresh(supplier)
+    logger.info("supplier.created", supplier_id=str(supplier.id), name=supplier.name)
     return {"success": True, "data": {"id": supplier.id, "name": supplier.name}}
 
 @router.post("/merge")

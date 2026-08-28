@@ -1,8 +1,6 @@
 from typing import List, Dict, Any
-
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
-
 from app.models import Supplier
 from app.services.google_search_service import google_search
 
@@ -14,6 +12,17 @@ SUPPLIER_TYPE_PRIORITY = {
     "unknown": 4,
 }
 
+def _infer_type(title: str, snippet: str = "") -> str:
+    text = f"{title} {snippet}".lower()
+    if any(w in text for w in ["производитель", "завод", "manufacturer", "производство"]):
+        return "manufacturer"
+    if any(w in text for w in ["дистрибьютор", "distributor", "официальный дилер"]):
+        return "distributor"
+    if any(w in text for w in ["опт", "wholesale", "оптовый"]):
+        return "wholesaler"
+    if any(w in text for w in ["магазин", "shop", "retail", "розница"]):
+        return "retail"
+    return "unknown"
 
 def _normalize_supplier(
     id: Any,
@@ -24,7 +33,7 @@ def _normalize_supplier(
     source: str,
     match_relevance: str,
     is_new: bool,
-    type: str = "unknown",
+    type: str = "",
     snippet: str = "",
 ) -> Dict[str, Any]:
     return {
@@ -36,10 +45,9 @@ def _normalize_supplier(
         "source": source,
         "match_relevance": match_relevance,
         "is_new": is_new,
-        "type": type,
+        "type": type or _infer_type(name, snippet),
         "snippet": snippet[:200] if snippet else "",
     }
-
 
 async def search_suppliers_in_db(
     db: AsyncSession,
@@ -57,7 +65,6 @@ async def search_suppliers_in_db(
     result = await db.execute(stmt)
     return list(result.scalars().all())
 
-
 async def search_suppliers_external(query: str, limit: int = 10) -> List[Dict[str, Any]]:
     results = await google_search(query, num=limit)
     suppliers = []
@@ -65,7 +72,6 @@ async def search_suppliers_external(query: str, limit: int = 10) -> List[Dict[st
         link = item.get("link", "")
         title = item.get("title", "")
         snippet = item.get("snippet", "")
-        domain = link.split("/")[2] if "://" in link else ""
         suppliers.append(
             _normalize_supplier(
                 id=None,
@@ -81,7 +87,6 @@ async def search_suppliers_external(query: str, limit: int = 10) -> List[Dict[st
         )
     return suppliers
 
-
 async def search_suppliers_combined(
     db: AsyncSession,
     query: str,
@@ -89,11 +94,9 @@ async def search_suppliers_combined(
 ) -> List[Dict[str, Any]]:
     internal = await search_suppliers_in_db(db, query, limit)
     external = await search_suppliers_external(query, limit)
-
     seen_emails = set()
     seen_domains = set()
     result = []
-
     for s in internal:
         email = s.email or ""
         domain = s.website.replace("https://", "").replace("http://", "").split("/")[0] if s.website else ""
@@ -118,7 +121,6 @@ async def search_suppliers_combined(
                 type=s.type,
             )
         )
-
     for ext in external:
         email = ext.get("email", "")
         domain = ext.get("website", "").replace("https://", "").replace("http://", "").split("/")[0] if ext.get("website") else ""
@@ -132,10 +134,8 @@ async def search_suppliers_combined(
             seen_domains.add(domain)
         ext["id"] = None
         ext["is_new"] = True
+        # Тип уже определён в _normalize_supplier
         result.append(ext)
-
-    # Приоритизация: тип -> relevance
     priority_map = {"high": 0, "medium": 1, "low": 2}
     result.sort(key=lambda x: (SUPPLIER_TYPE_PRIORITY.get(x.get("type", "unknown"), 4), priority_map.get(x.get("match_relevance", "medium"), 1)))
-
     return result[:limit]

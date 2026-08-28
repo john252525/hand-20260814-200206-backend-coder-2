@@ -7,8 +7,7 @@ from app.core.database import AsyncSessionLocal
 from app.models import (
     CommercialOffer, Communication, LotSupplier, Supplier, Tender, TenderPosition, TenderSource,
 )
-from app.workers.negotiate import _negotiate, _count_communications_by_type, _count_negotiation_communications_by_tender
-
+from app.workers.negotiate import _negotiate, _count_negotiation_communications_by_tender
 
 @pytest.mark.asyncio
 async def test_negotiate_worker_clarification_limit(setup_db):
@@ -48,19 +47,14 @@ async def test_negotiate_worker_clarification_limit(setup_db):
             ))
         await db.commit()
         tender_id = tender.id
-
     await _negotiate(str(tender_id), None, 'request_clarification', [], None)
-
     async with AsyncSessionLocal() as db:
-        comm_count = await _count_communications_by_type(db, tender_id, 'clarification')
-        # Проверяем, что новых писем не добавилось
         ls = (await db.execute(select(LotSupplier).where(LotSupplier.tender_id == tender_id))).scalar_one()
         new_comms = (await db.execute(
             select(Communication).where(Communication.lot_supplier_id == ls.id, Communication.message_type == 'clarification')
         )).scalars().all()
         assert len(new_comms) == 2  # больше не добавилось
         assert ls.status == 'NO_RESPONSE'  # лимит исчерпан
-
 
 @pytest.mark.asyncio
 async def test_negotiate_worker_discount(setup_db):
@@ -107,9 +101,7 @@ async def test_negotiate_worker_discount(setup_db):
         db.add(OfferPosition(commercial_offer_id=offer2.id, tender_position_id=tp.id, supplier_name='Ноутбук', match_type='exact', price_per_unit=Decimal('90000'), total_price=Decimal('90000')))
         await db.commit()
         tender_id = tender.id
-
     await _negotiate(str(tender_id), None, 'request_discount', [], None)
-
     async with AsyncSessionLocal() as db:
         discount_comms = (await db.execute(
             select(Communication).where(Communication.tender_id == tender_id, Communication.message_type == 'discount_request')

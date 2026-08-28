@@ -1,4 +1,4 @@
-.PHONY: run worker beat migrate test lint
+.PHONY: run worker beat migrate makemigrations test test_all lint clean
 
 run:
 	uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
@@ -18,5 +18,11 @@ makemigrations:
 test:
 	pytest -v
 
+test_all:
+	python -m pytest tests/ -v
+
 lint:
 	ruff check app
+
+clean:
+	../cleanup.sh

@@ -1,13 +1,10 @@
 from datetime import datetime, timezone
 from typing import List, Optional
-
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-
 from app.models import Tender, CommercialOffer, Decision, Supplier, TenderPosition
 from app.services.risk_service import evaluate_risks
 from app.services.settings_service import get_section
-
 
 def get_auto_recommendation(margin_percent: Optional[float], risk_level: str, settings: dict) -> str:
     min_margin = settings.get("min_margin_percent", 15.0)
@@ -21,7 +18,6 @@ def get_auto_recommendation(margin_percent: Optional[float], risk_level: str, se
         return "REVIEW"
     return "APPROVE"
 
-
 async def create_decision(
     db: AsyncSession,
     tender: Tender,
@@ -34,7 +30,6 @@ async def create_decision(
     """Создаёт или обновляет решение по тендеру."""
     result = await db.execute(select(Decision).where(Decision.tender_id == tender.id))
     existing = result.scalar_one_or_none()
-
     settings = await get_section(db, "scoring")
     offer = None
     supplier = None
@@ -42,7 +37,11 @@ async def create_decision(
         offer = await db.get(CommercialOffer, chosen_offer_id)
     if chosen_supplier_id:
         supplier = await db.get(Supplier, chosen_supplier_id)
-
+    risk = evaluate_risks(
+        tender, offer, settings,
+        tender_positions=tender_positions or [],
+        supplier=supplier,
+    )
     if existing:
         existing.decision = decision
         existing.reason = reason
@@ -51,19 +50,9 @@ async def create_decision(
         existing.decided_at = datetime.now(timezone.utc)
         if offer:
             existing.margin_at_decision = offer.margin_absolute
-        risk = evaluate_risks(
-            tender, offer, settings,
-            tender_positions=tender_positions or [],
-            supplier=supplier,
-        )
         existing.risk_level_at_decision = risk["level"]
+        existing.risk_details = risk["factors"]
         return existing
-
-    risk = evaluate_risks(
-        tender, offer, settings,
-        tender_positions=tender_positions or [],
-        supplier=supplier,
-    )
     dec = Decision(
         tender_id=tender.id,
         decision=decision,
@@ -71,6 +60,7 @@ async def create_decision(
         chosen_offer_id=chosen_offer_id,
         margin_at_decision=offer.margin_absolute if offer else None,
         risk_level_at_decision=risk["level"],
+        risk_details=risk["factors"],
         reason=reason,
     )
     db.add(dec)

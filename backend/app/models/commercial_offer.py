@@ -11,7 +11,7 @@ class CommercialOffer(Base, UUIDMixin, TimestampMixin):
     __tablename__ = "commercial_offers"
     lot_supplier_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("lot_suppliers.id"), nullable=False)
     tender_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tenders.id"), nullable=False)
-    source_communication_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("communications.id"), nullable=True)
+    source_communication_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("communications.id"), nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, server_default="PROCESSING")
     coverage: Mapped[float] = mapped_column(Float, nullable=False, server_default="0")
     clarification_needed: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
@@ -31,6 +31,9 @@ class CommercialOffer(Base, UUIDMixin, TimestampMixin):
     # Relationships
     positions: Mapped[List["OfferPosition"]] = relationship(back_populates="offer", cascade="all, delete-orphan")
     lot_supplier: Mapped["LotSupplier"] = relationship(back_populates="commercial_offers")
+    source_communication: Mapped[Optional["Communication"]] = relationship(
+        "Communication", foreign_keys=[source_communication_id]
+    )
 
 class OfferPosition(Base, UUIDMixin):
     __tablename__ = "offer_positions"

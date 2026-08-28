@@ -1,16 +1,13 @@
 import uuid
 from typing import Optional
-
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
-
+from sqlalchemy.orm import selectinload, joinedload
 from app.core.database import get_db
-from app.models import CommercialOffer, LotSupplier, Task
+from app.models import CommercialOffer, LotSupplier, Task, Tender, Supplier, Communication
 
 router = APIRouter()
-
 
 @router.get("")
 async def list_commercial_offers(
@@ -21,7 +18,11 @@ async def list_commercial_offers(
     per_page: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
 ):
-    query = select(CommercialOffer)
+    query = select(CommercialOffer).options(
+        joinedload(CommercialOffer.lot_supplier).joinedload(LotSupplier.supplier),
+        joinedload(CommercialOffer.lot_supplier).joinedload(LotSupplier.tender),
+        joinedload(CommercialOffer.source_communication),
+    )
     if tender_id:
         query = query.where(CommercialOffer.tender_id == tender_id)
     if supplier_id:
@@ -29,7 +30,6 @@ async def list_commercial_offers(
     if status:
         statuses = [s.strip() for s in status.split(",") if s.strip()]
         query = query.where(CommercialOffer.status.in_(statuses))
-
     total = await db.scalar(select(func.count()).select_from(query.subquery()))
     result = await db.execute(
         query.order_by(CommercialOffer.created_at.desc())
@@ -37,25 +37,29 @@ async def list_commercial_offers(
         .limit(per_page)
     )
     offers = result.scalars().all()
+    data = []
+    for o in offers:
+        received_at = o.source_communication.received_at if o.source_communication else None
+        data.append({
+            "id": o.id,
+            "tender_id": o.tender_id,
+            "tender_title": o.lot_supplier.tender.title if o.lot_supplier and o.lot_supplier.tender else None,
+            "supplier_id": o.lot_supplier.supplier_id if o.lot_supplier else None,
+            "supplier_name": o.lot_supplier.supplier.name if o.lot_supplier and o.lot_supplier.supplier else None,
+            "lot_supplier_id": o.lot_supplier_id,
+            "status": o.status,
+            "coverage": o.coverage,
+            "total_cost_with_all": o.total_cost_with_all,
+            "margin_absolute": o.margin_absolute,
+            "margin_percent": o.margin_percent,
+            "received_at": received_at,
+            "created_at": o.created_at,
+        })
     return {
         "success": True,
-        "data": [
-            {
-                "id": o.id,
-                "tender_id": o.tender_id,
-                "lot_supplier_id": o.lot_supplier_id,
-                "status": o.status,
-                "coverage": o.coverage,
-                "total_cost_with_all": o.total_cost_with_all,
-                "margin_absolute": o.margin_absolute,
-                "margin_percent": o.margin_percent,
-                "created_at": o.created_at,
-            }
-            for o in offers
-        ],
+        "data": data,
         "meta": {"page": page, "per_page": per_page, "total": total, "pages": max(1, (total + per_page - 1) // per_page)},
     }
-
 
 @router.get("/{offer_id}")
 async def get_commercial_offer(offer_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
@@ -106,14 +110,11 @@ async def get_commercial_offer(offer_id: uuid.UUID, db: AsyncSession = Depends(g
         },
     }
 
-
 @router.post("/{offer_id}/reparse", status_code=202)
 async def reparse_offer(offer_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
     offer = await db.get(CommercialOffer, offer_id)
     if not offer:
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Commercial offer not found"})
-
-    # Проверяем, нет ли уже активной задачи на этот offer
     existing_task = await db.execute(
         select(Task).where(
             Task.entity_type == "commercial_offer",
@@ -123,7 +124,6 @@ async def reparse_offer(offer_id: uuid.UUID, db: AsyncSession = Depends(get_db))
     )
     if existing_task.scalar_one_or_none():
         raise HTTPException(status_code=409, detail={"code": "CONFLICT", "message": "A reparse task is already in progress"})
-
     task = Task(
         task_type="PARSE_CP",
         status="PENDING",
@@ -133,12 +133,10 @@ async def reparse_offer(offer_id: uuid.UUID, db: AsyncSession = Depends(get_db))
     db.add(task)
     await db.commit()
     await db.refresh(task)
-
     from app.workers.parse_cp import parse_cp_task
     celery_task = parse_cp_task.delay(str(offer_id), str(task.id))
     task.celery_task_id = celery_task.id
     await db.commit()
-
     return {
         "success": True,
         "data": {

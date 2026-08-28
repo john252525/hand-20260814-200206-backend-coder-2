@@ -19,6 +19,7 @@ from app.services.email_classifier import classify_email
 from app.workers.celery_app import celery_app
 from app.workers.parse_cp import parse_cp_task
 from app.services.webhook_integration import notify_cp_received
+from app.services.document_parser import extract_text_from_file
 
 logger = structlog.get_logger(__name__)
 
@@ -113,6 +114,9 @@ async def _process_incoming_email(email_data: dict):
         )
         db.add(comm)
         await db.flush()
+        logger.info("communication.received", communication_id=str(comm.id), supplier_id=str(supplier.id), tender_id=str(lot_supplier.tender_id), message_type=message_type)
+        # Сохраняем вложения и извлекаем из них текст
+        attachment_texts = []
         for path in email_data.get("attachments", []):
             filename = path.split("/")[-1]
             db.add(CommunicationAttachment(
@@ -121,14 +125,23 @@ async def _process_incoming_email(email_data: dict):
                 file_size_bytes=os.path.getsize(path) if os.path.exists(path) else 0,
                 storage_path=path,
             ))
+            try:
+                text = await extract_text_from_file(path)
+                if text:
+                    attachment_texts.append(text)
+            except Exception as e:
+                logger.warning("process_incoming.attachment_error", file=path, error=str(e))
         offer_id = None
         if message_type == "cp_response":
+            full_text = body
+            if attachment_texts:
+                full_text += "\n\n" + "\n\n".join(attachment_texts)
             offer = CommercialOffer(
                 lot_supplier_id=lot_supplier.id,
                 tender_id=lot_supplier.tender_id,
                 source_communication_id=comm.id,
                 status="PROCESSING",
-                raw_text_snippet=body[:2000],
+                raw_text_snippet=full_text[:12000],
             )
             db.add(offer)
             await db.flush()

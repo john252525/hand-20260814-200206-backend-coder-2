@@ -1,13 +1,15 @@
-import io
 import json
 import os
 from datetime import datetime, timezone
-from typing import List, Optional, Tuple
+from typing import List, Optional
+import structlog
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.models import Tender, TenderDocument, TenderPosition, TenderRequirement
 from app.services.llm_service import chat_completion
+
+logger = structlog.get_logger(__name__)
 
 SUPPORTED_EXTENSIONS = {'.pdf', '.docx', '.xlsx', '.txt', '.csv'}
 
@@ -38,12 +40,12 @@ async def extract_text_from_file(file_path: str, mime_type: str = "") -> str:
         else:  # txt, csv
             with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
                 return f.read()
-    except Exception:
+    except Exception as e:
+        logger.error("document_parser.extract_error", file=file_path, error=str(e))
         return ""
 
 async def extract_tender_data(db: AsyncSession, tender: Tender) -> None:
     """Извлекает структурированные данные из всех документов тендера через LLM."""
-    # Удаляем старые позиции и требования (защита от дублей при reprocess)
     await db.execute(delete(TenderPosition).where(TenderPosition.tender_id == tender.id))
     await db.execute(delete(TenderRequirement).where(TenderRequirement.tender_id == tender.id))
     await db.flush()
@@ -61,11 +63,13 @@ async def extract_tender_data(db: AsyncSession, tender: Tender) -> None:
         else:
             doc.parse_status = "ERROR"
             doc.parse_error = "Файл не найден или не загружен на диск"
+
     combined_text = "\n\n".join(texts)[:12000]
     if not combined_text:
         return
     if not settings.llm_api_key:
         return
+
     prompt = f"""Ты — анализатор тендерной документации. Извлеки из предоставленного текста структурированные данные.
 Текст документации:
 {combined_text}
@@ -76,41 +80,66 @@ async def extract_tender_data(db: AsyncSession, tender: Tender) -> None:
 }}
 Если какой-то параметр не указан — ставь null или значение по умолчанию.
 Ответ — ТОЛЬКО JSON."""
+
     response = await chat_completion(prompt)
     if not response:
+        tender.processing_error = "LLM вернул пустой ответ"
         return
+
     try:
         data = json.loads(response)
-        tender.structured_data = data
-        positions = data.get("positions", [])
-        for idx, p in enumerate(positions, 1):
-            tp = TenderPosition(
-                tender_id=tender.id,
-                position_number=p.get("position_number", idx),
-                name=p.get("name", ""),
-                characteristics=p.get("characteristics", ""),
-                gost=p.get("gost", ""),
-                okpd2=p.get("okpd2", ""),
-                quantity=p.get("quantity") or 0,
-                unit=p.get("unit", "шт"),
-                is_essential=p.get("is_essential", True),
-            )
-            db.add(tp)
-        req_data = data.get("requirements", {})
-        req = TenderRequirement(
+    except json.JSONDecodeError as e:
+        logger.error("document_parser.invalid_json", error=str(e))
+        tender.processing_error = "LLM вернул некорректный JSON"
+        return
+
+    # Валидация
+    positions = data.get("positions", [])
+    if not isinstance(positions, list) or len(positions) == 0:
+        tender.processing_error = "LLM не извлёк позиции"
+        return
+
+    for p in positions:
+        if not isinstance(p, dict) or not p.get("name") or not p.get("quantity"):
+            tender.processing_error = "Позиция содержит некорректные данные"
+            return
+        try:
+            qty = float(p["quantity"])
+        except (TypeError, ValueError):
+            tender.processing_error = "Количество не является числом"
+            return
+        if qty <= 0:
+            tender.processing_error = "Количество должно быть больше нуля"
+            return
+
+    tender.structured_data = data
+    for idx, p in enumerate(positions, 1):
+        tp = TenderPosition(
             tender_id=tender.id,
-            delivery_date=datetime.fromisoformat(req_data["delivery_date"]) if req_data.get("delivery_date") else None,
-            delivery_address=req_data.get("delivery_address", ""),
-            delivery_conditions=req_data.get("delivery_conditions", ""),
-            license_required=req_data.get("license_required", False),
-            sro_required=req_data.get("sro_required", False),
-            security_bid=req_data.get("security_bid"),
-            security_contract=req_data.get("security_contract"),
-            prepayment_percent=req_data.get("prepayment_percent"),
-            stages_count=req_data.get("stages_count", 1),
-            special_conditions=req_data.get("special_conditions", []),
+            position_number=p.get("position_number", idx),
+            name=p.get("name", ""),
+            characteristics=p.get("characteristics", ""),
+            gost=p.get("gost", ""),
+            okpd2=p.get("okpd2", ""),
+            quantity=p.get("quantity") or 0,
+            unit=p.get("unit", "шт"),
+            is_essential=p.get("is_essential", True),
         )
-        db.add(req)
-        await db.flush()
-    except Exception:
-        pass
+        db.add(tp)
+
+    req_data = data.get("requirements", {})
+    req = TenderRequirement(
+        tender_id=tender.id,
+        delivery_date=datetime.fromisoformat(req_data["delivery_date"]) if req_data.get("delivery_date") else None,
+        delivery_address=req_data.get("delivery_address", ""),
+        delivery_conditions=req_data.get("delivery_conditions", ""),
+        license_required=req_data.get("license_required", False),
+        sro_required=req_data.get("sro_required", False),
+        security_bid=req_data.get("security_bid"),
+        security_contract=req_data.get("security_contract"),
+        prepayment_percent=req_data.get("prepayment_percent"),
+        stages_count=req_data.get("stages_count", 1),
+        special_conditions=req_data.get("special_conditions", []),
+    )
+    db.add(req)
+    await db.flush()

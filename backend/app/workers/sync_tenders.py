@@ -5,11 +5,10 @@ import httpx
 from sqlalchemy import select
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
-from app.models import Tender, TenderSource, Task
+from app.models import Tender, TenderSource, Task, TenderStatusHistory
 from app.workers.celery_app import celery_app
 
 logger = structlog.get_logger(__name__)
-
 GOSPLAN_TEST_URL = "https://v2test.gosplan.info/fz44/purchases"
 
 @celery_app.task(name="sync_tenders", bind=True)
@@ -41,7 +40,6 @@ async def _sync(source_id: str | None = None, task_id: str | None = None):
             if task:
                 task.status = "IN_PROGRESS"
                 await db.commit()
-
     async with AsyncSessionLocal() as db:
         if source_id:
             from uuid import UUID
@@ -53,7 +51,6 @@ async def _sync(source_id: str | None = None, task_id: str | None = None):
         if not source:
             logger.warning("sync_tenders.source_not_found", source_id=source_id)
             return
-
         url = source.api_url or settings.tender_source_api_url or GOSPLAN_TEST_URL
         params = {"limit": 50, "skip": 0, "published_after": "2024-01-01T00:00:00Z"}
         async with httpx.AsyncClient(timeout=30) as client:
@@ -69,13 +66,14 @@ async def _sync(source_id: str | None = None, task_id: str | None = None):
                 if task_id:
                     await _update_task_error(task_id, str(e))
                 return
-
         created = 0
         updated = 0
+        found_ids = set()
         for item in items:
             purchase_number = item.get("purchase_number", "")
             if not purchase_number:
                 continue
+            found_ids.add(purchase_number)
             existing = await db.execute(
                 select(Tender).where(Tender.source_id == source.id, Tender.source_tender_id == purchase_number)
             )
@@ -88,6 +86,7 @@ async def _sync(source_id: str | None = None, task_id: str | None = None):
                 customers = item.get("customers") or []
                 if customers:
                     existing_tender.customer_inn = str(customers[0])
+                existing_tender.missing_count = 0
                 updated += 1
                 continue
             customers = item.get("customers") or []
@@ -106,9 +105,27 @@ async def _sync(source_id: str | None = None, task_id: str | None = None):
                 platform="ГосПлан",
                 source_url=f"{url}/{purchase_number}",
                 status="NEW",
+                missing_count=0,
             )
             db.add(tender)
             created += 1
+        # Архивация тендеров, отсутствующих в выдаче дважды
+        all_source_tenders = (await db.execute(
+            select(Tender).where(Tender.source_id == source.id)
+        )).scalars().all()
+        for t in all_source_tenders:
+            if t.source_tender_id in found_ids:
+                continue
+            t.missing_count = (t.missing_count or 0) + 1
+            if t.missing_count >= 2 and t.status not in ("APPROVED", "REJECTED", "ARCHIVED"):
+                # Добавляем запись в историю через прямой insert (избегаем циклического импорта)
+                db.add(TenderStatusHistory(
+                    tender_id=t.id,
+                    status="ARCHIVED",
+                    previous_status=t.status,
+                    note="Тендер отсутствовал в выдаче источника 2 раза подряд",
+                ))
+                t.status = "ARCHIVED"
         source.last_sync_at = datetime.now(timezone.utc)
         source.last_sync_status = "success"
         source.last_error = None

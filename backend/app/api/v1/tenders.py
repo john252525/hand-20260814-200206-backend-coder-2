@@ -8,12 +8,11 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from app.core.database import get_db
-from app.models import Tender, TenderStatusHistory, LotSupplier, Supplier, Task, TenderPosition, TenderDocument, Communication, CommercialOffer, TenderSource
+from app.models import Tender, TenderStatusHistory, LotSupplier, Supplier, Task, TenderPosition, TenderDocument, Communication, CommercialOffer, TenderSource, Category, Decision
 from app.services.tender_status_service import change_tender_status
 from app.services.webhook_integration import notify_tender_ready_for_decision
 
 router = APIRouter()
-
 
 class TenderCreate(BaseModel):
     source_id: Optional[uuid.UUID] = None
@@ -31,7 +30,6 @@ class TenderCreate(BaseModel):
     source_url: str = ''
     documents_urls: list[str] = []
     skip_auto_processing: bool = False
-
     @field_validator('deadline_at')
     @classmethod
     def validate_deadline(cls, v, info):
@@ -69,7 +67,6 @@ class CommunicationSendPayload(BaseModel):
     body: str = ''
     message_type: str = 'manual'
     attachments_file_ids: list[uuid.UUID] = []
-
 
 async def _get_or_create_manual_source(db: AsyncSession) -> TenderSource:
     result = await db.execute(select(TenderSource).where(TenderSource.type == 'manual'))
@@ -117,7 +114,6 @@ async def _tender_to_summary(t: Tender, include_description: bool = False) -> di
         'created_at': t.created_at,
         'updated_at': t.updated_at,
     }
-
 
 @router.get('')
 async def list_tenders(
@@ -195,7 +191,6 @@ async def list_tenders(
         'meta': {'page': page, 'per_page': per_page, 'total': total, 'pages': max(1, (total + per_page - 1) // per_page)},
     }
 
-
 @router.post('', status_code=201)
 async def create_tender(payload: TenderCreate, db: AsyncSession = Depends(get_db)):
     if payload.source_id is None:
@@ -245,7 +240,6 @@ async def create_tender(payload: TenderCreate, db: AsyncSession = Depends(get_db
         resp['data']['task_id'] = task.id
     return resp
 
-
 @router.get('/stats')
 async def tender_stats(db: AsyncSession = Depends(get_db)):
     total = await db.scalar(select(func.count()).select_from(Tender)) or 0
@@ -262,7 +256,6 @@ async def tender_stats(db: AsyncSession = Depends(get_db)):
         if cat_id:
             category = await db.get(Category, cat_id)
             by_category.append({'category_id': cat_id, 'category_name': category.name if category else None, 'count': count})
-    # Время обработки: от created_at до перехода в READY_FOR_DECISION/APPROVED
     from datetime import timedelta
     processing_times = []
     history_result = await db.execute(
@@ -280,16 +273,13 @@ async def tender_stats(db: AsyncSession = Depends(get_db)):
             if diff >= 0:
                 processing_times.append(diff)
     avg_processing_time_minutes = round(sum(processing_times) / len(processing_times), 1) if processing_times else 0
-    # Решения
     approved = await db.scalar(select(func.count()).select_from(Decision).where(Decision.decision == 'APPROVED')) or 0
     rejected = await db.scalar(select(func.count()).select_from(Decision).where(Decision.decision == 'REJECTED')) or 0
     total_decisions = approved + rejected
     approval_rate_percent = round(approved / total_decisions * 100, 1) if total_decisions else 0
-    # Средняя маржа по решениям
     avg_margin_result = await db.execute(select(func.avg(Decision.margin_at_decision)).where(Decision.decision == 'APPROVED'))
     avg_margin = avg_margin_result.scalar()
     avg_margin_percent = float(avg_margin) if avg_margin else 0
-    # Сумма одобренных НМЦК
     total_approved_volume = await db.scalar(
         select(func.sum(Tender.nmck)).join(Decision).where(Decision.decision == 'APPROVED')
     ) or 0
@@ -306,7 +296,6 @@ async def tender_stats(db: AsyncSession = Depends(get_db)):
         },
     }
 
-
 @router.get('/{tender_id}')
 async def get_tender(tender_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
     tender = await db.get(
@@ -314,6 +303,7 @@ async def get_tender(tender_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
         tender_id,
         options=[
             selectinload(Tender.category),
+            selectinload(Tender.source),
             selectinload(Tender.documents),
             selectinload(Tender.positions),
             selectinload(Tender.lot_suppliers).selectinload(LotSupplier.supplier),
@@ -343,7 +333,7 @@ async def get_tender(tender_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
         'success': True,
         'data': {
             'id': tender.id,
-            'source_id': tender.source_id,
+            'source': {'id': tender.source_id, 'name': tender.source.name if tender.source else None},
             'source_tender_id': tender.source_tender_id,
             'title': tender.title,
             'description': tender.description,
@@ -376,7 +366,6 @@ async def get_tender(tender_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
         },
     }
 
-
 @router.get('/{tender_id}/timeline')
 async def get_timeline(tender_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
     result = await db.execute(
@@ -389,7 +378,6 @@ async def get_timeline(tender_id: uuid.UUID, db: AsyncSession = Depends(get_db))
         {'timestamp': h.set_at, 'event_type': 'STATUS_CHANGE', 'description': f"{h.previous_status or ''} -> {h.status}" + (f" ({h.note})" if h.note else ''), 'details': {}}
         for h in history
     ]}
-
 
 @router.patch('/{tender_id}')
 async def update_tender(tender_id: uuid.UUID, payload: TenderUpdate, db: AsyncSession = Depends(get_db)):
@@ -406,7 +394,6 @@ async def update_tender(tender_id: uuid.UUID, payload: TenderUpdate, db: AsyncSe
     if tender.status == 'READY_FOR_DECISION' and old_status != 'READY_FOR_DECISION':
         await notify_tender_ready_for_decision(tender.id)
     return {'success': True, 'data': {'id': tender.id, 'status': tender.status}}
-
 
 @router.post('/{tender_id}/reprocess', status_code=202)
 async def reprocess_tender(tender_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
@@ -432,7 +419,6 @@ async def reprocess_tender(tender_id: uuid.UUID, db: AsyncSession = Depends(get_
     task.celery_task_id = celery_task.id
     await db.commit()
     return {'success': True, 'data': {'task_id': task.id, 'status': 'ACCEPTED', 'check_url': f'/api/v1/tasks/{task.id}'}}
-
 
 @router.post('/{tender_id}/supplier-search-results/confirm')
 async def confirm_suppliers(tender_id: uuid.UUID, payload: SupplierConfirm, db: AsyncSession = Depends(get_db)):
@@ -478,7 +464,6 @@ async def confirm_suppliers(tender_id: uuid.UUID, payload: SupplierConfirm, db: 
     await db.commit()
     return {'success': True, 'data': {'linked': linked}}
 
-
 @router.post('/{tender_id}/request-cp', status_code=202)
 async def request_cp(tender_id: uuid.UUID, payload: RequestCpPayload, db: AsyncSession = Depends(get_db)):
     tender = await db.get(Tender, tender_id)
@@ -494,7 +479,6 @@ async def request_cp(tender_id: uuid.UUID, payload: RequestCpPayload, db: AsyncS
     await db.commit()
     return {'success': True, 'data': {'task_id': task.id, 'status': 'ACCEPTED', 'check_url': f'/api/v1/tasks/{task.id}'}}
 
-
 @router.post('/{tender_id}/search-suppliers', status_code=202)
 async def search_suppliers(tender_id: uuid.UUID, payload: SearchSuppliersPayload, db: AsyncSession = Depends(get_db)):
     tender = await db.get(Tender, tender_id)
@@ -509,7 +493,6 @@ async def search_suppliers(tender_id: uuid.UUID, payload: SearchSuppliersPayload
     task.celery_task_id = celery_task.id
     await db.commit()
     return {'success': True, 'data': {'task_id': task.id, 'status': 'ACCEPTED', 'check_url': f'/api/v1/tasks/{task.id}'}}
-
 
 @router.get('/{tender_id}/supplier-search-results')
 async def supplier_search_results(tender_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
@@ -540,7 +523,6 @@ async def supplier_search_results(tender_id: uuid.UUID, db: AsyncSession = Depen
             'suppliers': task.output_data.get('results', []),
         },
     }
-
 
 @router.get('/{tender_id}/communications')
 async def tender_communications(tender_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
@@ -582,7 +564,6 @@ async def tender_communications(tender_id: uuid.UUID, db: AsyncSession = Depends
             ],
         })
     return {'success': True, 'data': {'tender_id': tender_id, 'supplier_threads': threads}}
-
 
 @router.post('/{tender_id}/communications/send', status_code=201)
 async def send_communication(tender_id: uuid.UUID, payload: CommunicationSendPayload, db: AsyncSession = Depends(get_db)):

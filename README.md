@@ -6,10 +6,17 @@
 FastAPI + PostgreSQL/pgvector + Redis + Celery + OpenAI + Google Search + SMTP/IMAP
 
 ## Быстрый старт
+
 1. `cp .env.example .env`
 2. `docker-compose up -d postgres redis`
 3. `cd backend && make migrate`
 4. `make run`, `make worker`, `make beat`
+
+## Очистка репозитория
+Если в репозитории остались дублирующиеся каталоги (`backend/backend/`, корневые `migrations/`) или временные файлы (`*_fixed.py`), выполните:
+```bash
+./cleanup.sh
+```
 
 ## Демо-сценарий
 1. Создать токен: `python -m app.cli.token_cli create --description "demo"`

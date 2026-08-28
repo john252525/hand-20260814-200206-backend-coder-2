@@ -1,30 +1,22 @@
 import json
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
-from typing import List, Tuple
-
+from typing import List, Tuple, Optional
+import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-
 from app.core.config import settings
-from app.models import (
-    CommercialOffer,
-    Tender,
-    TenderPosition,
-    OfferPosition,
-)
+from app.models import CommercialOffer, Tender, TenderPosition, OfferPosition
 from app.services.llm_service import chat_completion
 
+logger = structlog.get_logger(__name__)
 
 CP_EXTRACT_PROMPT = """
 Ты — анализатор коммерческих предложений. Извлеки из предоставленного текста структурированные данные.
-
 Текст КП:
 {cp_text}
-
 Позиции тендера (для сопоставления):
 {tender_positions_json}
-
 Извлеки строго в формате JSON:
 {{
   "positions": [
@@ -53,7 +45,6 @@ CP_EXTRACT_PROMPT = """
   }},
   "valid_until": "YYYY-MM-DD или null"
 }}
-
 Правила:
 - match_type = "exact" если позиция полностью соответствует тендерной (тот же бренд/модель/характеристики)
 - match_type = "analog" если предлагается замена с аналогичными характеристиками
@@ -64,7 +55,6 @@ CP_EXTRACT_PROMPT = """
 Ответ — ТОЛЬКО JSON.
 """
 
-
 async def parse_cp_text(
     db: AsyncSession,
     tender: Tender,
@@ -74,7 +64,6 @@ async def parse_cp_text(
         select(TenderPosition).where(TenderPosition.tender_id == tender.id)
     )
     positions = list(result.scalars().all())
-
     if not settings.llm_api_key:
         return _fallback_parse(positions, cp_text), positions
 
@@ -91,7 +80,6 @@ async def parse_cp_text(
         ],
         ensure_ascii=False,
     )
-
     prompt = CP_EXTRACT_PROMPT.format(
         cp_text=cp_text[:12000],
         tender_positions_json=positions_json,
@@ -99,13 +87,12 @@ async def parse_cp_text(
     response = await chat_completion(prompt)
     if not response:
         return _fallback_parse(positions, cp_text), positions
-
     try:
         parsed = json.loads(response)
-        return parsed, positions
-    except Exception:
+    except json.JSONDecodeError as e:
+        logger.error("cp_parser.invalid_json", error=str(e))
         return _fallback_parse(positions, cp_text), positions
-
+    return parsed, positions
 
 def _fallback_parse(positions: List[TenderPosition], cp_text: str) -> dict:
     parsed_positions = []
@@ -130,7 +117,6 @@ def _fallback_parse(positions: List[TenderPosition], cp_text: str) -> dict:
         "valid_until": None,
     }
 
-
 async def save_parsed_cp(
     db: AsyncSession,
     commercial_offer: CommercialOffer,
@@ -138,12 +124,21 @@ async def save_parsed_cp(
     tender: Tender,
 ) -> None:
     """Сохраняет позиции КП и пересчитывает маржу."""
-    # Явно загружаем позиции тендера, чтобы избежать MissingGreenlet
     result = await db.execute(
         select(TenderPosition).where(TenderPosition.tender_id == tender.id)
     )
     tender_positions = list(result.scalars().all())
-    tender.positions = tender_positions  # Присваиваем, чтобы relationship не триггерил lazy-load
+    tender.positions = tender_positions
+
+    # Валидация структуры
+    raw_positions = parsed.get("positions", [])
+    if not isinstance(raw_positions, list) or len(raw_positions) == 0:
+        commercial_offer.status = "ERROR"
+        commercial_offer.clarification_needed = True
+        commercial_offer.clarification_items = ["Не удалось извлечь позиции из КП"]
+        commercial_offer.parsed_at = datetime.now(timezone.utc)
+        logger.error("cp.parsed_error", offer_id=str(commercial_offer.id), tender_id=str(tender.id))
+        return
 
     new_positions = []
     total_cost = Decimal("0")
@@ -151,7 +146,7 @@ async def save_parsed_cp(
     total_positions = len(tender_positions)
     clarification_items = []
 
-    for item in parsed.get("positions", []):
+    for item in raw_positions:
         pos_num = item.get("tender_position_number")
         tender_pos = next((tp for tp in tender_positions if tp.position_number == pos_num), None)
         price = item.get("price_per_unit")
@@ -161,12 +156,10 @@ async def save_parsed_cp(
             price_dec = None
         quantity = tender_pos.quantity if tender_pos else None
         total_price = price_dec * quantity if price_dec and quantity else None
-
         if price_dec and tender_pos:
             coverage_count += 1
         if total_price:
             total_cost += total_price
-
         position = OfferPosition(
             commercial_offer_id=commercial_offer.id,
             tender_position_id=tender_pos.id if tender_pos else None,
@@ -184,12 +177,13 @@ async def save_parsed_cp(
         new_positions.append(position)
 
     commercial_offer.positions = new_positions
-
     delivery_cost = Decimal("0")
     delivery_terms = parsed.get("delivery_terms", {})
     if delivery_terms and delivery_terms.get("delivery_cost"):
-        delivery_cost = Decimal(str(delivery_terms["delivery_cost"]))
-
+        try:
+            delivery_cost = Decimal(str(delivery_terms["delivery_cost"]))
+        except (InvalidOperation, TypeError):
+            delivery_cost = Decimal("0")
     total_cost_with_delivery = total_cost + delivery_cost
 
     security_bid = None
@@ -203,7 +197,6 @@ async def save_parsed_cp(
     except (InvalidOperation, TypeError):
         sec_bid = Decimal("0")
         sec_contract = Decimal("0")
-
     total_cost_with_all = total_cost_with_delivery + sec_bid + sec_contract
     nmck = tender.nmck or Decimal("0")
     margin_abs = nmck - total_cost_with_all if nmck else Decimal("0")
@@ -215,12 +208,11 @@ async def save_parsed_cp(
     commercial_offer.total_cost_with_all = total_cost_with_all
     commercial_offer.margin_absolute = margin_abs
     commercial_offer.margin_percent = float(margin_pct)
-
     coverage = (coverage_count / total_positions * 100) if total_positions else 0
     commercial_offer.coverage = coverage
     commercial_offer.status = "FULL" if coverage == 100 else ("PARTIAL" if coverage > 0 else "NONE")
 
-    if any(pp.get("price_per_unit") is None for pp in parsed.get("positions", [])):
+    if any(pp.get("price_per_unit") is None for pp in raw_positions):
         clarification_items.append("Не указана цена по некоторым позициям")
     if not delivery_terms or not delivery_terms.get("delivery_days"):
         clarification_items.append("Не указаны сроки поставки")
@@ -228,7 +220,7 @@ async def save_parsed_cp(
         clarification_items.append("Не указаны условия оплаты")
     if coverage < 100:
         clarification_items.append("Покрытие позиций менее 100%")
-
     commercial_offer.clarification_needed = bool(clarification_items)
     commercial_offer.clarification_items = clarification_items
     commercial_offer.parsed_at = datetime.now(timezone.utc)
+    logger.info("cp.parsed", offer_id=str(commercial_offer.id), tender_id=str(tender.id), status=commercial_offer.status, coverage=commercial_offer.coverage)

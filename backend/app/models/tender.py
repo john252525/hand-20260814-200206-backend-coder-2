@@ -4,17 +4,15 @@ from decimal import Decimal
 from typing import List, Optional
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
-    BigInteger, Boolean, DateTime, DECIMAL, Float, ForeignKey, String, Text, func, UniqueConstraint,
+    BigInteger, Boolean, DateTime, DECIMAL, Float, ForeignKey, String, Text, func, UniqueConstraint, Integer,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.models.base import Base, TimestampMixin, UUIDMixin
 
-
 class Tender(Base, UUIDMixin, TimestampMixin):
     __tablename__ = 'tenders'
     __table_args__ = (UniqueConstraint('source_id', 'source_tender_id', name='idx_tenders_source_id'),)
-
     source_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True), ForeignKey('tender_sources.id'), nullable=True
     )
@@ -31,6 +29,7 @@ class Tender(Base, UUIDMixin, TimestampMixin):
     platform: Mapped[str] = mapped_column(String(100), nullable=False, server_default='')
     source_url: Mapped[str] = mapped_column(Text, nullable=False, server_default='')
     status: Mapped[str] = mapped_column(String(50), nullable=False, server_default='NEW')
+    missing_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default='0')
     embedding: Mapped[Optional[List[float]]] = mapped_column(Vector(1536), nullable=True)
     structured_data: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     matched_category_id: Mapped[Optional[uuid.UUID]] = mapped_column(
@@ -47,7 +46,6 @@ class Tender(Base, UUIDMixin, TimestampMixin):
     risk_level: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
     risk_details: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     processing_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-
     source: Mapped[Optional['TenderSource']] = relationship()
     category: Mapped[Optional['Category']] = relationship('Category', foreign_keys=[matched_category_id])
     documents: Mapped[List['TenderDocument']] = relationship(back_populates='tender', cascade='all, delete-orphan')
@@ -55,7 +53,6 @@ class Tender(Base, UUIDMixin, TimestampMixin):
     status_history: Mapped[List['TenderStatusHistory']] = relationship(back_populates='tender', cascade='all, delete-orphan')
     lot_suppliers: Mapped[List['LotSupplier']] = relationship(back_populates='tender', cascade='all, delete-orphan')
     decisions: Mapped[Optional['Decision']] = relationship(back_populates='tender', uselist=False, cascade='all, delete-orphan')
-
 
 class TenderDocument(Base, UUIDMixin, TimestampMixin):
     __tablename__ = 'tender_documents'
@@ -69,7 +66,6 @@ class TenderDocument(Base, UUIDMixin, TimestampMixin):
     parse_status: Mapped[str] = mapped_column(String(20), nullable=False, server_default='PENDING')
     parse_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     tender: Mapped['Tender'] = relationship(back_populates='documents')
-
 
 class TenderPosition(Base, UUIDMixin):
     __tablename__ = 'tender_positions'
@@ -85,7 +81,6 @@ class TenderPosition(Base, UUIDMixin):
     notes: Mapped[str] = mapped_column(Text, nullable=False, server_default='')
     tender: Mapped['Tender'] = relationship(back_populates='positions')
 
-
 class TenderRequirement(Base, UUIDMixin):
     __tablename__ = 'tender_requirements'
     tender_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey('tenders.id'), nullable=False, unique=True)
@@ -99,7 +94,6 @@ class TenderRequirement(Base, UUIDMixin):
     prepayment_percent: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     stages_count: Mapped[int] = mapped_column(nullable=False, server_default='1')
     special_conditions: Mapped[list] = mapped_column(JSONB, nullable=False, server_default='[]')
-
 
 class TenderStatusHistory(Base, UUIDMixin):
     __tablename__ = 'tender_status_history'

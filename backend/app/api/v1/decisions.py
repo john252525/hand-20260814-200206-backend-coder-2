@@ -1,12 +1,12 @@
-from typing import Optional
+from typing import Optional, List
 from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import selectinload, joinedload
 from app.core.database import get_db
-from app.models import Decision, Tender, CommercialOffer, Supplier, Task
+from app.models import Decision, Tender, CommercialOffer, Supplier, Task, LotSupplier
 from app.services.decision_service import create_decision, get_auto_recommendation
 from app.services.settings_service import get_section
 from app.services.tender_status_service import change_tender_status
@@ -36,7 +36,12 @@ async def list_decisions(
     per_page: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
 ):
-    query = select(Tender).join(Decision).options(selectinload(Tender.decisions))
+    query = select(Tender).join(Decision).options(
+        joinedload(Tender.decisions).joinedload(Decision.chosen_supplier),
+        joinedload(Tender.decisions).joinedload(Decision.chosen_offer),
+        selectinload(Tender.lot_suppliers).selectinload(LotSupplier.supplier),
+        selectinload(Tender.lot_suppliers).selectinload(LotSupplier.commercial_offers),
+    )
     if status:
         statuses = [s.strip() for s in status.split(",") if s.strip()]
         query = query.where(Tender.status.in_(statuses))
@@ -61,6 +66,20 @@ async def list_decisions(
         dec = dec[0] if isinstance(dec, list) else dec
         best_offer = dec.chosen_offer if dec.chosen_offer_id else None
         best_supplier = dec.chosen_supplier if dec.chosen_supplier_id else None
+        # Альтернативные поставщики из других КП этого тендера
+        alternatives = []
+        for ls in t.lot_suppliers:
+            if ls.supplier_id == (best_supplier.id if best_supplier else None):
+                continue
+            for offer in ls.commercial_offers:
+                if offer.margin_percent is not None:
+                    alternatives.append({
+                        "id": ls.supplier_id,
+                        "name": ls.supplier.name if ls.supplier else None,
+                        "margin_percent": offer.margin_percent,
+                    })
+                    break
+        risk_factors = dec.risk_details.get("factors", []) if dec.risk_details else []
         data.append({
             "tender_id": t.id,
             "tender_title": t.title,
@@ -73,10 +92,10 @@ async def list_decisions(
                 "final_price": best_offer.total_cost_with_all if best_offer else None,
                 "margin_percent": best_offer.margin_percent if best_offer else None,
             },
-            "alternative_suppliers": [],
+            "alternative_suppliers": alternatives,
             "risk_assessment": {
                 "level": dec.risk_level_at_decision,
-                "factors": [],
+                "factors": risk_factors,
             },
             "auto_recommendation": get_auto_recommendation(best_offer.margin_percent if best_offer else None, dec.risk_level_at_decision or "LOW", scoring_settings),
             "status": t.status,
